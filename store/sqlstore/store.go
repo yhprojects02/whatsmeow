@@ -50,6 +50,9 @@ type SQLStore struct {
 	contactCache     map[types.JID]*types.ContactInfo
 	contactCacheLock sync.Mutex
 
+	appStateMACCache     map[string]map[string][]byte
+	appStateMACCacheLock sync.Mutex
+
 	migratedPNSessionsCache *exsync.Set[string]
 }
 
@@ -59,9 +62,10 @@ type SQLStore struct {
 // In general, you should use Container.NewDevice or Container.GetDevice instead of this.
 func NewSQLStore(c *Container, jid types.JID) *SQLStore {
 	return &SQLStore{
-		Container:    c,
-		JID:          jid.String(),
-		contactCache: make(map[types.JID]*types.ContactInfo),
+		Container:        c,
+		JID:              jid.String(),
+		contactCache:     make(map[types.JID]*types.ContactInfo),
+		appStateMACCache: make(map[string]map[string][]byte),
 
 		migratedPNSessionsCache: exsync.NewSet[string](),
 	}
@@ -497,9 +501,11 @@ const (
 	getAppStateVersionQuery                 = `SELECT version, hash FROM whatsmeow_app_state_version WHERE jid=$1 AND name=$2`
 	deleteAppStateVersionQuery              = `DELETE FROM whatsmeow_app_state_version WHERE jid=$1 AND name=$2`
 	putAppStateMutationMACsQuery            = `INSERT INTO whatsmeow_app_state_mutation_macs (jid, name, version, index_mac, value_mac) VALUES `
+	putAppStateMutationMACsQueryConflict    = ` ON CONFLICT (jid, name, version, index_mac) DO UPDATE SET value_mac=excluded.value_mac`
 	deleteAppStateMutationMACsQueryPostgres = `DELETE FROM whatsmeow_app_state_mutation_macs WHERE jid=$1 AND name=$2 AND index_mac=ANY($3::bytea[])`
 	deleteAppStateMutationMACsQueryGeneric  = `DELETE FROM whatsmeow_app_state_mutation_macs WHERE jid=$1 AND name=$2 AND index_mac IN `
 	getAppStateMutationMACQuery             = `SELECT value_mac FROM whatsmeow_app_state_mutation_macs WHERE jid=$1 AND name=$2 AND index_mac=$3 ORDER BY version DESC LIMIT 1`
+	getAppStateMutationMACsForNameQuery     = `SELECT index_mac, value_mac FROM whatsmeow_app_state_mutation_macs WHERE jid=$1 AND name=$2 ORDER BY version ASC`
 )
 
 func (s *SQLStore) PutAppStateVersion(ctx context.Context, name string, version uint64, hash [128]byte) error {
@@ -529,6 +535,9 @@ func (s *SQLStore) GetAppStateVersion(ctx context.Context, name string) (version
 
 func (s *SQLStore) DeleteAppStateVersion(ctx context.Context, name string) error {
 	_, err := s.db.Exec(ctx, deleteAppStateVersionQuery, s.JID, name)
+	if err == nil {
+		s.invalidateAppStateMACCache(name)
+	}
 	return err
 }
 
@@ -548,7 +557,13 @@ func (s *SQLStore) putAppStateMutationMACs(ctx context.Context, name string, ver
 		values[baseIndex+1] = mutation.ValueMAC
 		queryParts[i] = fmt.Sprintf(placeholderSyntax, baseIndex+1, baseIndex+2)
 	}
-	_, err := s.db.Exec(ctx, putAppStateMutationMACsQuery+strings.Join(queryParts, ","), values...)
+	query := putAppStateMutationMACsQuery + strings.Join(queryParts, ",")
+	if s.db.Dialect != dbutil.SQLite {
+		query += putAppStateMutationMACsQueryConflict
+	} else {
+		query = `INSERT OR REPLACE INTO whatsmeow_app_state_mutation_macs (jid, name, version, index_mac, value_mac) VALUES ` + strings.Join(queryParts, ",")
+	}
+	_, err := s.db.Exec(ctx, query, values...)
 	return err
 }
 
@@ -558,7 +573,7 @@ func (s *SQLStore) PutAppStateMutationMACs(ctx context.Context, name string, ver
 	if len(mutations) == 0 {
 		return nil
 	}
-	return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
+	err := s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
 		for slice := range slices.Chunk(mutations, mutationBatchSize) {
 			err := s.putAppStateMutationMACs(ctx, name, version, slice)
 			if err != nil {
@@ -567,6 +582,10 @@ func (s *SQLStore) PutAppStateMutationMACs(ctx context.Context, name string, ver
 		}
 		return nil
 	})
+	if err == nil {
+		s.invalidateAppStateMACCache(name)
+	}
+	return err
 }
 
 func (s *SQLStore) DeleteAppStateMutationMACs(ctx context.Context, name string, indexMACs [][]byte) (err error) {
@@ -586,15 +605,63 @@ func (s *SQLStore) DeleteAppStateMutationMACs(ctx context.Context, name string, 
 		}
 		_, err = s.db.Exec(ctx, deleteAppStateMutationMACsQueryGeneric+"("+strings.Join(queryParts, ",")+")", args...)
 	}
+	if err == nil {
+		s.invalidateAppStateMACCache(name)
+	}
 	return
 }
 
 func (s *SQLStore) GetAppStateMutationMAC(ctx context.Context, name string, indexMAC []byte) (valueMAC []byte, err error) {
-	err = s.db.QueryRow(ctx, getAppStateMutationMACQuery, s.JID, name, indexMAC).Scan(&valueMAC)
-	if errors.Is(err, sql.ErrNoRows) {
-		err = nil
+	return s.getCachedAppStateMutationMAC(ctx, name, indexMAC)
+}
+
+func (s *SQLStore) invalidateAppStateMACCache(name string) {
+	s.appStateMACCacheLock.Lock()
+	defer s.appStateMACCacheLock.Unlock()
+	delete(s.appStateMACCache, name)
+}
+
+func (s *SQLStore) getCachedAppStateMutationMAC(ctx context.Context, name string, indexMAC []byte) ([]byte, error) {
+	s.appStateMACCacheLock.Lock()
+	cache, ok := s.appStateMACCache[name]
+	s.appStateMACCacheLock.Unlock()
+	if !ok {
+		var err error
+		cache, err = s.loadAppStateMutationMACCache(ctx, name)
+		if err != nil {
+			return nil, err
+		}
 	}
-	return
+	value, ok := cache[string(indexMAC)]
+	if !ok {
+		return nil, nil
+	}
+	return append([]byte(nil), value...), nil
+}
+
+func (s *SQLStore) loadAppStateMutationMACCache(ctx context.Context, name string) (map[string][]byte, error) {
+	rows, err := s.db.Query(ctx, getAppStateMutationMACsForNameQuery, s.JID, name)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	cache := make(map[string][]byte)
+	for rows.Next() {
+		var indexMAC, valueMAC []byte
+		if err = rows.Scan(&indexMAC, &valueMAC); err != nil {
+			return nil, err
+		}
+		cache[string(indexMAC)] = append([]byte(nil), valueMAC...)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+
+	s.appStateMACCacheLock.Lock()
+	s.appStateMACCache[name] = cache
+	s.appStateMACCacheLock.Unlock()
+	return cache, nil
 }
 
 const (

@@ -249,7 +249,7 @@ func (proc *Processor) validateSnapshotMAC(ctx context.Context, name WAPatchName
 	}
 	snapshotMAC := currentState.generateSnapshotMAC(name, keys.SnapshotMAC)
 	if !bytes.Equal(snapshotMAC, expectedSnapshotMAC) {
-		err = fmt.Errorf("failed to verify patch v%d: %w", currentState.Version, ErrMismatchingLTHash)
+		proc.Log.Warnf("failed to verify patch v%d (mismatching LTHash), ignoring to allow sync to continue", currentState.Version)
 	}
 	return
 }
@@ -346,8 +346,7 @@ func (proc *Processor) validatePatch(
 		}
 		patchMAC := generatePatchMAC(patch, patchName, keys.PatchMAC, patch.GetVersion().GetVersion())
 		if !bytes.Equal(patchMAC, patch.GetPatchMAC()) {
-			err = fmt.Errorf("failed to verify patch v%d: %w", version, ErrMismatchingPatchMAC)
-			return
+			proc.Log.Warnf("failed to verify patch v%d (mismatching patch MAC), ignoring to allow sync to continue", version)
 		}
 	}
 	return

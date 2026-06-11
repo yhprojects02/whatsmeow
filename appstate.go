@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -200,13 +201,22 @@ func (cli *Client) filterContacts(mutations []appstate.Mutation) ([]appstate.Mut
 	filteredMutations := mutations[:0]
 	contacts := make([]store.ContactEntry, 0, len(mutations))
 	for _, mutation := range mutations {
-		if mutation.Index[0] == "contact" && len(mutation.Index) > 1 {
-			jid, _ := types.ParseJID(mutation.Index[1])
-			act := mutation.Action.GetContactAction()
+		if len(mutation.Index) > 1 && (mutation.Index[0] == appstate.IndexContact || mutation.Index[0] == appstate.IndexLIDContact) {
+			jid, _ := types.ParseJID(normalizeAppStateContactIndexJID(mutation.Index[0], mutation.Index[1]))
+			var firstName, fullName string
+			if mutation.Index[0] == appstate.IndexLIDContact {
+				act := mutation.Action.GetLidContactAction()
+				firstName = act.GetFirstName()
+				fullName = act.GetFullName()
+			} else {
+				act := mutation.Action.GetContactAction()
+				firstName = act.GetFirstName()
+				fullName = act.GetFullName()
+			}
 			contacts = append(contacts, store.ContactEntry{
 				JID:       jid,
-				FirstName: act.GetFirstName(),
-				FullName:  act.GetFullName(),
+				FirstName: firstName,
+				FullName:  fullName,
 			})
 		} else {
 			filteredMutations = append(filteredMutations, mutation)
@@ -240,7 +250,7 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 
 	var jid types.JID
 	if len(mutation.Index) > 1 {
-		jid, _ = types.ParseJID(mutation.Index[1])
+		jid, _ = types.ParseJID(normalizeAppStateContactIndexJID(mutation.Index[0], mutation.Index[1]))
 	}
 	ts := time.UnixMilli(mutation.Action.GetTimestamp())
 
@@ -275,6 +285,11 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 	case appstate.IndexContact:
 		act := mutation.Action.GetContactAction()
 		eventToDispatch = &events.Contact{JID: jid, Timestamp: ts, Action: act, FromFullSync: fullSync}
+		if cli.Store.Contacts != nil {
+			storeUpdateError = cli.Store.Contacts.PutContactName(ctx, jid, act.GetFirstName(), act.GetFullName())
+		}
+	case appstate.IndexLIDContact:
+		act := mutation.Action.GetLidContactAction()
 		if cli.Store.Contacts != nil {
 			storeUpdateError = cli.Store.Contacts.PutContactName(ctx, jid, act.GetFirstName(), act.GetFullName())
 		}
@@ -408,6 +423,20 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 		cli.Log.Errorf("Failed to update device store after app state mutation: %v", storeUpdateError)
 	}
 	return
+}
+
+func normalizeAppStateContactIndexJID(indexType, rawJID string) string {
+	if strings.Contains(rawJID, "@") {
+		return rawJID
+	}
+	switch indexType {
+	case appstate.IndexContact:
+		return rawJID + "@" + types.DefaultUserServer
+	case appstate.IndexLIDContact:
+		return rawJID + "@" + types.HiddenUserServer
+	default:
+		return rawJID
+	}
 }
 
 func (cli *Client) downloadExternalAppStateBlob(ctx context.Context, ref *waServerSync.ExternalBlobReference) ([]byte, error) {
