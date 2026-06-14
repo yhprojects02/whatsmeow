@@ -341,7 +341,17 @@ func (cli *Client) EncryptPollVote(ctx context.Context, pollInfo *types.MessageI
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal poll vote protobuf: %w", err)
 	}
-	ciphertext, iv, err := cli.encryptMsgSecret(ctx, cli.getOwnID(), pollInfo.Chat, pollInfo.Sender, pollInfo.ID, EncSecretPollVote, plaintext)
+	// Our identity as the voter must match how the poll creator addresses us in
+	// this chat. In a LID-addressed chat that's our own LID (like comments and
+	// reactions use); otherwise our phone JID. Using the wrong one makes the
+	// creator unable to decrypt our vote, so it silently isn't counted.
+	ownID := cli.getOwnID()
+	if pollInfo.Chat.Server == types.HiddenUserServer {
+		if lid := cli.getOwnLID(); !lid.IsEmpty() {
+			ownID = lid
+		}
+	}
+	ciphertext, iv, err := cli.encryptMsgSecret(ctx, ownID, pollInfo.Chat, pollInfo.Sender, pollInfo.ID, EncSecretPollVote, plaintext)
 	if err != nil {
 		return nil, fmt.Errorf("failed to encrypt poll vote: %w", err)
 	}
