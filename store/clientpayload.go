@@ -100,6 +100,13 @@ func SetWAVersion(version WAVersionContainer) {
 	}
 	waVersion = version
 	waVersionHash = version.Hash()
+	// BaseClientPayload.UserAgent.AppVersion is built once at package init from
+	// the hardcoded waVersion, and it is the field WhatsApp actually reads when
+	// deciding whether a client is too old. Without this line SetWAVersion moved
+	// the version everywhere except the handshake, so connecting still failed
+	// with "Client outdated (405)" while reporting the new version number.
+	// Upstream fix: tulir/whatsmeow a763037 "store/clientpayload: fix SetWAVersion".
+	BaseClientPayload.UserAgent.AppVersion = waVersion.ProtoAppVersion()
 }
 
 var BaseClientPayload = &waWa6.ClientPayload{
