@@ -422,7 +422,45 @@ func (cli *Client) delayedRequestMessageFromPhone(info *types.MessageInfo) {
 	cli.immediateRequestMessageFromPhone(ctx, info)
 }
 
+// MaxPhoneRerequests is how many times the same message may be requested from the phone.
+// The server keeps redelivering placeholders for messages the phone never manages to
+// re-encrypt, and each request surfaces as a sync request on the phone, so the number of
+// requests per message ID has to be bounded.
+const MaxPhoneRerequests = 3
+
+// maxTrackedPhoneRerequests bounds the memory used by the rerequest counters. Hitting it
+// means the session is producing an absurd number of undecryptable messages; the counters
+// are dropped so the map can't grow without limit.
+const maxTrackedPhoneRerequests = 2048
+
+// claimPhoneRerequest reserves one request-from-phone slot for the given message ID and
+// reports whether the request may be sent.
+func (cli *Client) claimPhoneRerequest(id types.MessageID) bool {
+	if id == "" {
+		return false
+	}
+	cli.phoneRerequestCountLock.Lock()
+	defer cli.phoneRerequestCountLock.Unlock()
+	if cli.phoneRerequestCounts == nil {
+		cli.phoneRerequestCounts = make(map[types.MessageID]int)
+	}
+	count := cli.phoneRerequestCounts[id]
+	if count >= MaxPhoneRerequests {
+		return false
+	}
+	if count == 0 && len(cli.phoneRerequestCounts) >= maxTrackedPhoneRerequests {
+		cli.Log.Warnf("Resetting phone rerequest counters after tracking %d messages", len(cli.phoneRerequestCounts))
+		cli.phoneRerequestCounts = make(map[types.MessageID]int)
+	}
+	cli.phoneRerequestCounts[id] = count + 1
+	return true
+}
+
 func (cli *Client) immediateRequestMessageFromPhone(ctx context.Context, info *types.MessageInfo) {
+	if !cli.claimPhoneRerequest(info.ID) {
+		cli.Log.Debugf("Not requesting message %s from phone again, rerequest limit reached", info.ID)
+		return
+	}
 	_, err := cli.SendPeerMessage(ctx, cli.BuildUnavailableMessageRequest(info.Chat, info.Sender, info.ID))
 	if err != nil {
 		cli.Log.Warnf("Failed to send request for unavailable message %s to phone: %v", info.ID, err)

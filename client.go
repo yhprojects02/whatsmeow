@@ -96,6 +96,9 @@ type Client struct {
 	pendingPhoneRerequests             map[types.MessageID]context.CancelFunc
 	pendingPhoneRerequestsLock         sync.RWMutex
 
+	phoneRerequestCounts    map[types.MessageID]int
+	phoneRerequestCountLock sync.Mutex
+
 	appStateProc     *appstate.Processor
 	appStateSyncLock sync.Mutex
 
@@ -265,6 +268,7 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		appStateKeyRequests:    make(map[string]time.Time),
 
 		pendingPhoneRerequests: make(map[types.MessageID]context.CancelFunc),
+		phoneRerequestCounts:   make(map[types.MessageID]int),
 
 		EnableAutoReconnect: true,
 		AutoTrustIdentity:   true,
